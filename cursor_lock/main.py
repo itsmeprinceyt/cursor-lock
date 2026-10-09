@@ -110,6 +110,51 @@ WS_EX_APPWINDOW   = 0x00040000
 
 
 # ============================================================
+# BUG FIX NOTES  —  multi-monitor / Genshin Impact
+# ============================================================
+#
+# Symptom reported by the user:
+#   Game runs on MONITOR 1 (primary).  Cursor-lock starts fine.
+#   But as soon as an in-game menu is opened, the cursor is
+#   clipped to MONITOR 2 (left monitor) instead.
+#
+# Root cause:
+#   1. find_target_window() used to return the FIRST visible
+#      window belonging to the target PID.  EnumWindows walks
+#      in Z-order (top-most first), so the moment the game
+#      spawned a transient helper / overlay / cursor window,
+#      THAT window was returned instead of the main game
+#      window.  Genshin creates such small helper windows on
+#      the PRIMARY monitor — which is what caused the jump.
+#
+#   2. get_monitor_rect_from_window() then took the CENTRE
+#      POINT of that small helper window and asked Windows
+#      which monitor it was on.  Result: primary monitor.
+#
+#   3. get_target_hwnd() re-scanned every 2 s, so a transient
+#      helper window could silently replace the real game
+#      window mid-session.
+#
+# Fix implemented below:
+#   A. find_target_window() now enumerates EVERY visible window
+#      of the target PID and keeps the one with the LARGEST
+#      client area.  The main game window is always the
+#      biggest, so overlays / cursor helpers are ignored.
+#
+#   B. get_monitor_rect_from_window() no longer relies on a
+#      single point.  It intersects the game window rect with
+#      every monitor and picks the monitor that covers the
+#      most area.  This also handles games whose reported
+#      window rect spans multiple monitors.
+#
+#   C. get_target_hwnd() prefers to keep an already-valid HWND
+#      instead of blindly re-scanning every 2 s.  A single
+#      stable HWND means the derived monitor rect is stable
+#      for the whole locking session.
+# ============================================================
+
+
+# ============================================================
 # GLOBAL STATE
 # ============================================================
 
@@ -179,15 +224,67 @@ def get_window_process_id(hwnd):
         return None
 
 
-def enumerate_visible_windows():
-    mapping = {}
+def _window_area(hwnd):
+    """Return the on-screen area (w*h) of a window, or 0 on failure."""
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        w = right - left
+        h = bottom - top
+        if w <= 0 or h <= 0:
+            return 0
+        return w * h
+    except Exception:
+        return 0
+
+
+def find_target_window():
+    """
+    Return the HWND of the largest visible window belonging to
+    any of the target PIDs.
+
+    FIX (see "BUG FIX NOTES" above): we no longer take the first
+    match from EnumWindows.  Instead we keep the biggest window,
+    which in practice is always the real game window.  Overlay
+    windows, cursor helpers, tooltips, launchers, etc. are
+    smaller and therefore ignored.
+    """
+    if not target_pids:
+        return None
+
+    # pid -> (area, hwnd)
+    best_by_pid = {}
 
     def callback(hwnd, _):
         try:
-            if win32gui.IsWindowVisible(hwnd):
-                pid = get_window_process_id(hwnd)
-                if pid and pid not in mapping:
-                    mapping[pid] = hwnd
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+
+            pid = get_window_process_id(hwnd)
+            if pid is None or pid not in target_pids:
+                return True
+
+            # Reject iconic (minimised) windows — GetWindowRect
+            # returns a bogus off-screen rect for them.
+            try:
+                if win32gui.IsIconic(hwnd):
+                    return True
+            except Exception:
+                pass
+
+            area = _window_area(hwnd)
+            if area <= 0:
+                return True
+
+            # Reject suspiciously tiny windows outright.  These
+            # are almost always helper windows the game creates
+            # for the system cursor or for input capture.
+            if area < 200 * 200:
+                return True
+
+            prev = best_by_pid.get(pid)
+            if prev is None or area > prev[0]:
+                best_by_pid[pid] = (area, hwnd)
+
         except Exception:
             pass
         return True
@@ -197,28 +294,41 @@ def enumerate_visible_windows():
     except Exception:
         pass
 
-    return mapping
-
-
-def find_target_window():
-    if not target_pids:
-        return None
-
-    mapping = enumerate_visible_windows()
-
+    # Prefer whichever target PID we actually found.
     for pid in target_pids:
-        hwnd = mapping.get(pid)
-        if hwnd:
-            return hwnd
+        entry = best_by_pid.get(pid)
+        if entry is not None:
+            return entry[1]
 
     return None
 
 
 def get_target_hwnd():
+    """
+    Return a stable HWND for the currently-targeted process.
+
+    FIX (see "BUG FIX NOTES" above): prefer an already-valid
+    cached HWND.  The original code re-scanned every 2 s, which
+    could silently swap the main game window for a transient
+    helper window — and thereby swap the monitor.
+    """
     global cached_hwnd, cached_hwnd_time
 
-    now = time.time()
+    # Reuse the cached HWND as long as it is still alive,
+    # visible, and still belongs to one of our target PIDs.
+    if cached_hwnd:
+        try:
+            if (win32gui.IsWindow(cached_hwnd)
+                    and win32gui.IsWindowVisible(cached_hwnd)
+                    and not win32gui.IsIconic(cached_hwnd)):
+                cached_pid = get_window_process_id(cached_hwnd)
+                if cached_pid in target_pids:
+                    return cached_hwnd
+        except Exception:
+            pass
 
+    # Cache is stale or invalid → full re-scan.
+    now = time.time()
     if cached_hwnd and (now - cached_hwnd_time) < HWND_CACHE_TIME:
         return cached_hwnd
 
@@ -259,21 +369,100 @@ def is_target_foreground():
 # MONITOR DETECTION
 # ============================================================
 
-def get_monitor_rect_from_window(hwnd):
+def get_monitors():
+    """
+    Return a list of monitor info dicts (keys: Monitor, Work, Flags).
+
+    Notes:
+      * pywin32's `win32api.EnumDisplayMonitors` takes only
+        (hdc, cliprect) and returns a list of
+        (hmonitor, hdc, rect) tuples — it does NOT accept a
+        callback the way the raw Win32 API does.
+      * `hmonitor` comes back as a `PyHANDLE`.  Pylance's stub for
+        `GetMonitorInfo` expects an `int`, so we coerce it.  At
+        runtime `PyHANDLE` and `int` are the same value.
+    """
+    monitors = []
+
     try:
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        for hmonitor, _hdc, _rect in win32api.EnumDisplayMonitors(None, None):
+            try:
+                monitors.append(win32api.GetMonitorInfo(int(hmonitor)))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-        center_x = (left + right) // 2
-        center_y = (top + bottom) // 2
+    return monitors
 
+
+def _intersection_area(rect_a, rect_b):
+    """Area of the intersection between two (l,t,r,b) rectangles."""
+    al, at, ar, ab = rect_a
+    bl, bt, br, bb = rect_b
+    il = max(al, bl)
+    it = max(at, bt)
+    ir = min(ar, br)
+    ib = min(ab, bb)
+    if ir <= il or ib <= it:
+        return 0
+    return (ir - il) * (ib - it)
+
+
+def get_monitor_rect_from_window(hwnd):
+    """
+    Return the (left, top, right, bottom) rect of the monitor that
+    the given window lives on.
+
+    FIX (see "BUG FIX NOTES" above): the original implementation
+    used a single centre point and asked the OS which monitor
+    that point was on.  That fails whenever the window is not
+    actually centred on the monitor it belongs to — exactly what
+    happened when Genshin's small helper window on the primary
+    monitor was mistaken for the game window.
+
+    The new implementation intersects the window rect with every
+    monitor and picks the monitor with the LARGEST overlap.
+    This is the same rule Windows itself uses for "which monitor
+    is this window on?" and it also tolerates games whose window
+    rect spans multiple monitors.
+    """
+    try:
+        win_rect = win32gui.GetWindowRect(hwnd)
+        wl, wt, wr, wb = win_rect
+        if wr <= wl or wb <= wt:
+            return None
+
+        monitors = get_monitors()
+        if not monitors:
+            # Fall back to the OS helper if we somehow can't
+            # enumerate monitors directly.
+            monitor = win32api.MonitorFromWindow(
+                hwnd, win32con.MONITOR_DEFAULTTONEAREST
+            )
+            return win32api.GetMonitorInfo(monitor)["Monitor"]
+
+        best_monitor = None
+        best_area = 0
+
+        for info in monitors:
+            mrect = info["Monitor"]
+            area = _intersection_area(win_rect, mrect)
+            if area > best_area:
+                best_area = area
+                best_monitor = info
+
+        if best_monitor is not None and best_area > 0:
+            return best_monitor["Monitor"]
+
+        # No intersection at all (window fully off-screen, minimised,
+        # etc.) — fall back to nearest.
+        cx = (wl + wr) // 2
+        cy = (wt + wb) // 2
         monitor = win32api.MonitorFromPoint(
-            (center_x, center_y),
-            win32con.MONITOR_DEFAULTTONEAREST
+            (cx, cy), win32con.MONITOR_DEFAULTTONEAREST
         )
-
-        info = win32api.GetMonitorInfo(monitor)
-
-        return info["Monitor"]
+        return win32api.GetMonitorInfo(monitor)["Monitor"]
 
     except Exception:
         return None
@@ -426,6 +615,27 @@ def find_pids_by_name(name):
     except Exception:
         pass
     return pids
+
+
+def enumerate_visible_windows():
+    mapping = {}
+
+    def callback(hwnd, _):
+        try:
+            if win32gui.IsWindowVisible(hwnd):
+                pid = get_window_process_id(hwnd)
+                if pid and pid not in mapping:
+                    mapping[pid] = hwnd
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(callback, None)
+    except Exception:
+        pass
+
+    return mapping
 
 
 # ============================================================
@@ -1244,8 +1454,6 @@ class RoundedCard(tk.Frame):
         height=None,
         **kwargs
     ):
-        # Build the frame kwargs conditionally so we never pass
-        # height=None to tk.Frame (which would raise a type error).
         frame_kwargs = {"bg": outer}
         if height is not None:
             frame_kwargs["height"] = height
@@ -1381,9 +1589,6 @@ content_area.pack(fill="both", expand=True, padx=0, pady=0)
 
 
 # ---------- PROCESS LIST CARD ----------
-# NOTE: packed with fill="both" but NOT expand=True.
-# The card's height comes naturally from the Treeview (height=8)
-# plus headers, so the buttons below always stay visible.
 
 list_card = RoundedCard(
     content_area, radius=14, fill=BG_CARD, outer=BG_MAIN, pad=1
